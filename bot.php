@@ -1,433 +1,408 @@
 <?php
 /**
- * BTC Faucet Auto Claim 24/7 - Optimized Single File
- *
+ * BTC Faucet Auto Claim 24/7 — Ultimate Edition
+ * 
+ * Zero dependency (tanpa curl/pcntl/posix/readline)
+ * Live cooldown timer + cool terminal UI
+ * 
  * Usage:
- *   php bot.php                          # Input initData, loop forever
- *   php bot.php --lifetime=86400         # Jalan 24 jam
- *   echo "initdata" | php bot.php        # Pipe input
+ *   php bot.php
+ *   php bot.php --lifetime=86400
  */
 
 set_time_limit(0);
 ini_set('memory_limit', '64M');
+error_reporting(E_ERROR | E_PARSE);
 
-// ============================================================
-// SIGNAL HANDLING
-// ============================================================
-$STOP = false;
-if (function_exists('pcntl_async_signals')) pcntl_async_signals(true);
-if (function_exists('pcntl_signal')) {
-    $h = function() { global $STOP; $STOP = true; };
-    pcntl_signal(SIGINT,  $h);
-    pcntl_signal(SIGTERM, $h);
-    pcntl_signal(SIGHUP,  $h);
-}
-
-// ============================================================
-// CONFIG
-// ============================================================
-$BASE     = 'https://btc.tonrevenue.space';
-$CD_SEC   = 299;       // cooldown server
-$TICK     = 3;         // interruptible sleep interval
-$MAX_RETR = 5;         // max consecutive error retry
-$UA       = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
+$C = [
+    'base'    => 'https://btc.tonrevenue.space',
+    'cd'      => 299,
+    'tick'    => 1,
+    'maxretry'=> 5,
+    'ua'      => 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+    'fp'      => json_encode(['version'=>'12.5.1','platform'=>'android','tg_platform'=>'android','language'=>'en','theme'=>'dark','screen_width'=>1080,'screen_height'=>2400,'online'=>true,'dpr'=>3]),
+];
 
 $lifetime = 0;
-$once     = false;
-foreach ($argv as $a) {
+foreach ($argv ?? [] as $a) {
     if (preg_match('/--lifetime=(\d+)/', $a, $m)) $lifetime = (int)$m[1];
-    if ($a === '--once') $once = true;
 }
 
 // ============================================================
-// BANNER + INPUT
+// ANSI HELPERS
 // ============================================================
-fwrite(STDERR, "\033[33m");
-fwrite(STDERR, "╔══════════════════════════════════════╗\n");
-fwrite(STDERR, "║   BTC Faucet Auto Claim 24/7        ║\n");
-fwrite(STDERR, "║   @fbtc0bot | +0.5 sats/claim       ║\n");
-fwrite(STDERR, "╚══════════════════════════════════════╝\n");
-fwrite(STDERR, "\033[0m\n");
+const ESC = "\033[";
+function ansi(string $code): string { return ESC . $code; }
+function clr(): void { echo ansi('0m'); }
+function c(int $code, int $mode = 0): void { echo ansi($mode . ';' . $code . 'm'); }
+function cursor_hide(): void { echo ansi('?25l'); }
+function cursor_show(): void { echo ansi('?25h'); }
+function cursor_up(int $n = 1): void { echo ansi($n . 'A'); }
+function clr_line(): void { echo ansi('2K'); echo "\r"; }
+function bold(string $t): string { return ansi('1m') . $t . ansi('22m'); }
+function dim(string $t): string { return ansi('2m') . $t . ansi('22m'); }
+
+// ============================================================
+// INPUT
+// ============================================================
+echo ansi('33m') . "
+ ╔═══════════════════════════════════════════╗
+ ║      BTC Faucet Auto Claim 24/7          ║
+ ║      @fbtc0bot | +0.5 sats/5min         ║
+ ╚═══════════════════════════════════════════╝
+" . ansi('0m');
 
 if (php_sapi_name() !== 'cli') die("CLI only.\n");
 
 $init = '';
-if (!posix_isatty(STDIN)) {
-    $init = trim(stream_get_contents(STDIN));
+$stdin = fopen('php://stdin', 'r');
+if ($stdin) {
+    $r = [$stdin]; $w = $e = null;
+    if (stream_select($r, $w, $e, 0) > 0) {
+        while (!feof($stdin)) {
+            $ch = fread($stdin, 8192);
+            if ($ch === false || $ch === '') break;
+            $init .= $ch;
+        }
+        $init = trim($init);
+    }
+    fclose($stdin);
 }
+
 if (empty($init)) {
-    fwrite(STDERR, "\033[36mPaste initData:\033[0m ");
-    $init = trim(readline("> "));
-}
-if (empty($init)) die("InitData kosong!\n");
-
-// Normalize: strip URL prefix kalau user paste full URL
-if (preg_match('/tgWebAppData=(.+?)(?:&tgWebApp|$)/', $init, $m)) {
-    $init = urldecode($m[1]);
-}
-fwrite(STDERR, "\033[32m[OK]\033[0m InitData loaded (" . strlen($init) . " chars)\n");
-if ($lifetime > 0) fwrite(STDERR, "Lifetime: {$lifetime}s (" . round($lifetime/60) . " min)\n");
-fwrite(STDERR, "\n");
-
-// ============================================================
-// LOG (ke stderr biar pipe ke file clean)
-// ============================================================
-function L(string $msg): void {
-    $t = date('H:i:s');
-    fwrite(STDERR, "[{$t}] {$msg}\n");
+    echo ansi('36m') . " initData: " . ansi('0m');
+    $init = trim(fgets(STDIN) ?: '');
 }
 
-// ============================================================
-// HTTP POST — kirim initData di body JSON
-// ============================================================
-function post(string $endpoint, array $extra = []): ?array {
-    global $BASE, $init, $UA;
+if (empty($init)) {
+    foreach ($argv ?? [] as $a) {
+        if (preg_match('/--data=(.+)/', $a, $m)) { $init = $m[1]; break; }
+    }
+}
 
-    $body = array_merge(['initData' => $init], $extra);
+if (empty($init)) die(ansi('31m') . "InitData kosong!" . ansi('0m') . "\n");
 
-    $ch = curl_init("{$BASE}{$endpoint}");
-    curl_setopt_array($ch, [
-        CURLOPT_POST           => true,
-        CURLOPT_POSTFIELDS     => json_encode($body),
-        CURLOPT_HTTPHEADER     => [
-            'Content-Type: application/json',
-            "User-Agent: {$UA}",
-            'Origin: https://btc.tonrevenue.space',
-            'Referer: https://btc.tonrevenue.space/',
-            'Accept: application/json',
-        ],
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT        => 30,
-        CURLOPT_CONNECTTIMEOUT => 15,
-        CURLOPT_SSL_VERIFYPEER => false,
-        CURLOPT_SSL_VERIFYHOST => 0,
-        CURLOPT_ENCODING       => 'gzip',
-        CURLOPT_FRESH_CONNECT  => true,
+// Normalize URL
+if (strpos($init, 'tgWebAppData=') !== false) {
+    if (preg_match('/tgWebAppData=(.+?)(?:&tgWebApp|$)/', $init, $m)) {
+        $init = urldecode($m[1]);
+    }
+}
+
+echo ansi('32m') . " OK " . ansi('0m') . "InitData (" . strlen($init) . " chars)\n";
+
+// ============================================================
+// HTTP POST (zero dep)
+// ============================================================
+function post(string $ep, array $extra = []): ?array {
+    global $C, $init;
+    $body = json_encode(array_merge(['initData' => $init], $extra));
+    $hdr = implode("\r\n", [
+        "Content-Type: application/json",
+        "User-Agent: {$C['ua']}",
+        'Origin: https://btc.tonrevenue.space',
+        'Referer: https://btc.tonrevenue.space/',
+        'Accept: application/json',
+        'Accept-Encoding: identity',
+        "Content-Length: " . strlen($body),
     ]);
-
-    $raw  = curl_exec($ch);
-    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $err  = curl_error($ch);
-    curl_close($ch);
-
-    if ($err) {
-        L("  \033[31mNET:\033[0m {$err}");
-        return null;
-    }
-
-    $d = json_decode($raw, true);
-    if (!$d) {
-        L("  \033[31mJSON:\033[0m HTTP {$code} | " . substr($raw, 0, 120));
-        return null;
-    }
-
-    // API error: detail field
-    if (isset($d['detail'])) {
-        return ['_error' => $d['detail'], '_code' => $code, '_raw' => $d];
-    }
-
+    $ctx = stream_context_create([
+        'http' => ['method'=>'POST','header'=>$hdr,'content'=>$body,'timeout'=>30,'ignore_errors'=>true],
+        'ssl'  => ['verify_peer'=>false,'verify_peer_name'=>false,'allow_self_signed'=>true],
+    ]);
+    $raw = @file_get_contents("{$C['base']}{$ep}", false, $ctx);
+    if ($raw === false) return null;
+    $h = $http_response_header ?? [];
+    foreach ($h as $x) { if (stripos($x, 'Content-Encoding: gzip') !== false) { $raw = @gzdecode($raw); break; } }
+    $d = @json_decode($raw, true);
+    if (!is_array($d)) return null;
+    if (isset($d['detail'])) return ['_err' => (string)$d['detail']];
     return $d;
 }
 
 // ============================================================
-// INTERRUPTIBLE SLEEP
+// CAPTCHA SOLVER — "Tap the X" → option id
 // ============================================================
-function zzz(int $seconds): void {
-    global $STOP;
-    $done = 0;
-    while ($done < $seconds && !$STOP) {
-        sleep(min($TICK, $seconds - $done));
-        $done += $TICK;
+function solve_cap(array $ch): ?string {
+    $prompt = strtolower($ch['prompt'] ?? '');
+    $opts   = $ch['options'] ?? [];
+    if (!$prompt || !$opts) return null;
+
+    // "tap the grapes" → extract "grapes"
+    $w = preg_split('/\s+/', preg_replace('/[^a-z\s]/', '', $prompt), -1, PREG_SPLIT_NO_EMPTY);
+    $stop = ['tap','click','the','a','an','select','choose','find','pick','button','icon','image','picture','that','which','is','in','on','of','to','with','this','shown','below','above','and','or'];
+    $kw = array_values(array_filter($w, fn($x) => strlen($x) > 1 && !in_array($x, $stop)));
+
+    // Score-based match
+    foreach ($opts as $o) {
+        $lbl = strtolower($o['label'] ?? '');
+        $id  = strtolower($o['id'] ?? '');
+        foreach ($kw as $k) {
+            if ($lbl === $k || $id === $k || ($k && strpos($lbl, $k) !== false)) return $o['id'];
+        }
     }
+    // Fuzzy
+    foreach ($opts as $o) {
+        $lbl = strtolower($o['label'] ?? '');
+        foreach ($kw as $k) {
+            if ($k && function_exists('levenshtein') && levenshtein($lbl, $k) <= 1) return $o['id'];
+        }
+    }
+    return $opts[0]['id'] ?? null;
 }
 
 // ============================================================
-// CAPTCHA SOLVER — "Tap the {X}" → match option label
+// LIVE COOLDOWN DISPLAY
 // ============================================================
-function solve_captcha(array $challenge): ?string {
-    $prompt  = $challenge['prompt'] ?? '';
-    $options = $challenge['options'] ?? [];
+function live_cd(int $seconds, float $bal, int $claims, int $fails, float $rate, float $mem): void {
+    global $lifetime;
+    $total = $seconds;
+    $elapsed_start = time();
 
-    if (empty($prompt) || empty($options)) return null;
+    while ($seconds > 0) {
+        // Lifetime check
+        if ($lifetime > 0 && (time() - $GLOBALS['t0']) >= $lifetime) break;
 
-    // Extract keyword: "Tap the Pear" → "pear"
-    // Also handle: "Tap the Orange" → "orange"
-    $clean = preg_replace('/[^a-zA-Z\s]/', '', strtolower($prompt));
-    $words = preg_split('/\s+/', $clean);
+        $m = (int)floor($seconds / 60);
+        $s = $seconds % 60;
+        $pct = $total > 0 ? (int)((($total - $seconds) / $total) * 100) : 0;
 
-    // Remove stop words
-    $stops = ['tap','click','the','a','an','select','choose','find','pick','button','icon','image','picture','that','which','is','in','on','of','to','with','this','shown','below','above','and','or'];
-    $kws = array_filter($words, fn($w) => strlen($w) > 1 && !in_array($w, $stops));
+        // Progress bar
+        $bar_w = 30;
+        $filled = (int)(($pct / 100) * $bar_w);
+        $bar = str_repeat('━', $filled) . str_repeat('─', $bar_w - $filled);
 
-    foreach ($options as $opt) {
-        $label = strtolower($opt['label'] ?? $opt['id'] ?? '');
-        foreach ($kws as $kw) {
-            // Exact match atau substring match
-            if ($label === $kw || strpos($label, $kw) !== false) {
-                return $opt['id'] ?? null;
-            }
-        }
+        $color = $seconds > 30 ? '33' : '35'; // yellow > purple near end
+
+        // Move cursor up 1 line and clear
+        echo ansi('1A') . ansi('2K') . "\r";
+
+        // Build status line
+        $up_h = (int)floor((time() - $GLOBALS['t0']) / 3600);
+        $up_m = (int)floor(((time() - $GLOBALS['t0']) % 3600) / 60);
+
+        echo ansi($color . 'm');
+        echo "  ⏳ {$m}:" . str_pad($s, 2, '0', STR_PAD_LEFT);
+        echo " ┃ {$bar} {$pct}%";
+        echo " ┃ Bal:" . ansi('1;33m') . " {$bal}" . ansi($color . 'm');
+        echo " ┃ +" . ansi('1;32m') . "{$claims}" . ansi($color . 'm');
+        echo " ✗{$fails}";
+        echo " ┃ {$rate}/hr";
+        echo " ┃ {$mem}MB";
+        echo " ┃ UP {$up_h}h{$up_m}m";
+        echo ansi('0m');
+
+        sleep(1);
+        $seconds--;
     }
 
-    // Fallback: exact word match di label
-    foreach ($options as $opt) {
-        $label = strtolower($opt['label'] ?? '');
-        foreach ($kws as $kw) {
-            if (levenshtein($label, $kw) <= 1) return $opt['id'] ?? null;
-        }
-    }
-
-    return $options[0]['id'] ?? null;
+    // Final clear
+    echo ansi('1A') . ansi('2K') . "\r";
+    echo "  " . ansi('32m') . "✅ READY" . ansi('0m') . " — claiming now...              \n";
 }
 
 // ============================================================
-// MAIN BOT
+// MAIN
 // ============================================================
-$retries     = 0;
-$claims      = 0;
-$failed      = 0;
-$captcha_ok_until = 0;  // timestamp, 0 = perlu solve
-$t0          = time();
+$retries = 0; $claims = 0; $fails = 0;
+$cap_ok_until = 0;
+$t0 = time();
 
-L("=== Bot started ===");
+cursor_hide();
 
-while (!$STOP) {
-    // Lifetime check
+echo "\n";
+
+while (true) {
     if ($lifetime > 0 && (time() - $t0) >= $lifetime) {
-        L("Lifetime reached ({$lifetime}s)");
+        echo "  " . ansi('33m') . "⏰ Lifetime reached" . ansi('0m') . "\n";
         break;
     }
 
-    // ---- STEP 1: INIT SESSION ----
-    L("[1/3] Init...");
-    $fp_json = json_encode([
-        'version' => '12.5.1', 'platform' => 'android', 'tg_platform' => 'android',
-        'language' => 'en', 'theme' => 'dark', 'screen_width' => 1080,
-        'screen_height' => 2400, 'online' => true, 'dpr' => 3,
-    ]);
+    $mem  = round(memory_get_usage(true) / 1048576, 1);
+    $up   = time() - $t0;
+    $rate = $up > 0 ? round(($claims / $up) * 3600, 1) : 0;
 
-    $resp = post('/api/init', ['fingerprint' => $fp_json]);
+    // ─── INIT ───
+    echo "  " . ansi('36m') . "⟳ Init..." . ansi('0m');
+    $resp = post('/api/init', ['fingerprint' => $C['fp']]);
 
     if ($resp === null) {
-        $retries++;
-        if ($retries >= $MAX_RETR) { L("Max retry, wait 60s..."); $retries = 0; zzz(60); }
-        else { $d = 5 * pow(2, min($retries, 5)); L("Retry {$retries}/{$MAX_RETR} in {$d}s"); zzz((int)$d); }
-        $failed++;
+        $retries++; $fails++;
+        $d = 5 * pow(2, min($retries, 5));
+        echo ansi('1A') . ansi('2K') . "\r";
+        echo "  " . ansi('31m') . "✗ Network error, retry {$retries}/{$C['maxretry']} ({$d}s)" . ansi('0m') . "\n";
+        if ($retries >= $C['maxretry']) { $retries = 0; sleep(60); } else sleep((int)$d);
         continue;
     }
 
-    if (isset($resp['_error'])) {
-        $msg = $resp['_error'];
-        L("  \033[31mERR:\033[0m {$msg}");
-
+    if (isset($resp['_err'])) {
+        $msg = $resp['_err'];
         if (stripos($msg, 'cooldown') !== false) {
-            // Parse "Try again in Xs"
-            if (preg_match('/(\d+)\s*s/', $msg, $m)) {
-                $wait = (int)$m[1] + 2;
-                L("  Cooldown: {$wait}s");
-                zzz($wait);
+            if (preg_match('/(\d+)\s*s/i', $msg, $m)) {
+                $w = (int)$m[1] + 2;
+                echo ansi('1A') . ansi('2K') . "\r";
+                $user = $resp['_raw'] ?? [];
+                $bal = (float)($user['user']['balance'] ?? $user['balance'] ?? 0);
+                echo "  " . ansi('35m') . "⏳ Server cooldown: {$w}s" . ansi('0m') . "\n";
+                live_cd($w, $bal, $claims, $fails, $rate, $mem);
                 $retries = 0;
                 continue;
             }
-            zzz($CD_SEC);
-            $retries = 0;
-            continue;
         }
-
-        // Auth error — initData mungkin expired
-        if (stripos($msg, 'auth') !== false || stripos($msg, 'invalid') !== false || stripos($msg, 'expired') !== false) {
-            L("  \033[31mInitData mungkin expired! Bot berhenti.\033[0m");
-            break;
-        }
-
-        $retries++;
-        if ($retries >= $MAX_RETR) { $retries = 0; zzz(60); }
-        else { zzz(10); }
-        $failed++;
+        echo ansi('1A') . ansi('2K') . "\r";
+        echo "  " . ansi('31m') . "✗ {$msg}" . ansi('0m') . "\n";
+        if (stripos($msg, 'auth') !== false || stripos($msg, 'invalid') !== false || stripos($msg, 'expired') !== false) break;
+        $retries++; $fails++;
+        if ($retries >= $C['maxretry']) { $retries = 0; sleep(60); } else sleep(10);
         continue;
     }
 
-    // Parse init response
-    $user     = $resp['user'] ?? [];
-    $balance  = (float)($user['balance'] ?? 0);
-    $cooldown = (int)($user['cooldown'] ?? 0);
-    $risk     = (float)($user['risk_score'] ?? 0);
-    $blocked  = !empty($user['is_blocked']);
+    $user = $resp['user'] ?? [];
+    $bal  = (float)($user['balance'] ?? 0);
+    $cd   = (int)($user['cooldown'] ?? 0);
+    $risk = (float)($user['risk_score'] ?? 0);
 
-    if ($blocked) {
-        L("  \033[31mACCOUNT BLOCKED!\033[0m " . ($user['ban_reason'] ?? ''));
+    if (!empty($user['is_blocked'])) {
+        echo ansi('1A') . ansi('2K') . "\r";
+        echo "  " . ansi('31m') . "🚫 BLOCKED: " . ($user['ban_reason'] ?? '') . ansi('0m') . "\n";
         break;
     }
 
-    L("  OK | Bal: \033[33m{$balance}\033[0m sats | CD: {$cooldown}s | Risk: {$risk}");
+    $cap_req = !empty($user['captcha_required']);
 
-    // ---- STEP 2: CAPTCHA (kalau perlu) ----
-    // Captcha valid 6 jam, cek apakah masih valid
-    $need_captcha = !empty($user['captcha_required']) && time() >= $captcha_ok_until;
+    echo ansi('1A') . ansi('2K') . "\r";
+    echo "  " . ansi('32m') . "✓" . ansi('0m') . " Bal:" . ansi('33m') . " {$bal}" . ansi('0m') . " CD:{$cd}s Risk:{$risk}\n";
 
-    if ($need_captcha) {
-        L("[2/3] Solve captcha...");
+    // ─── CAPTCHA ───
+    $need_cap = $cap_req && time() >= $cap_ok_until;
 
-        // Challenge dari init response
+    if ($need_cap) {
+        echo "  " . ansi('36m') . "🔒 Solving captcha..." . ansi('0m') . "\n";
+
         $challenge = $user['captcha_challenge'] ?? null;
-
         if (!$challenge) {
-            // Coba minta challenge baru
-            $ch_resp = post('/api/captcha/challenge');
-            if ($ch_resp && !isset($ch_resp['_error'])) {
-                $challenge = $ch_resp;
-            }
+            $cr = post('/api/captcha/challenge');
+            if ($cr && !isset($cr['_err'])) $challenge = $cr;
         }
 
         if ($challenge) {
             $prompt = $challenge['prompt'] ?? '?';
-            $answer = solve_captcha($challenge);
+            $answer = solve_cap($challenge);
             $cid    = $challenge['challenge_id'] ?? '';
 
-            L("  Q: \"{$prompt}\"");
+            $emoji_map = [];
+            foreach ($challenge['options'] ?? [] as $o) {
+                $emoji_map[$o['id'] ?? ''] = $o['emoji'] ?? '';
+            }
+            $emo = $emoji_map[$answer] ?? '';
+
+            echo "  " . dim("   Q: \"{$prompt}\"") . "\n";
+            echo "  " . dim("   A: {$emo} {$answer}") . "\n";
 
             if ($answer) {
-                L("  A: \"{$answer}\"");
-                $v = post('/api/captcha/verify', [
-                    'challenge_id' => $cid,
-                    'answer'       => $answer,
-                ]);
-
+                $v = post('/api/captcha/verify', ['challenge_id' => $cid, 'answer' => $answer]);
                 if ($v && ($v['status'] ?? '') === 'success') {
-                    $captcha_ok_until = strtotime($v['captcha_valid_until'] ?? '+6 hours');
-                    $valid_h = round(($captcha_ok_until - time()) / 3600, 1);
-                    L("  \033[32mCaptcha OK!\033[0m Valid {$valid_h}h");
+                    $cap_ok_until = strtotime($v['captcha_valid_until'] ?? '+6 hours');
+                    $vh = round(($cap_ok_until - time()) / 3600, 1);
+                    echo "  " . ansi('32m') . "🔓 Captcha OK! Valid {$vh}h" . ansi('0m') . "\n";
                 } else {
-                    $emsg = $v['_error']['detail'] ?? ($v['detail'] ?? 'failed');
-                    L("  \033[31mCaptcha fail: {$emsg}\033[0m");
-                    zzz(30);
-                    $failed++;
-                    continue;
+                    $em = $v['_err'] ?? ($v['detail'] ?? 'fail');
+                    echo "  " . ansi('31m') . "✗ Captcha: {$em}" . ansi('0m') . "\n";
+                    sleep(30); $fails++; continue;
                 }
             } else {
-                L("  \033[31mCannot solve captcha\033[0m");
-                zzz(30);
-                $failed++;
-                continue;
+                echo "  " . ansi('31m') . "✗ Cannot solve captcha" . ansi('0m') . "\n";
+                sleep(30); $fails++; continue;
             }
         } else {
-            L("  \033[31mNo challenge available\033[0m");
-            zzz(30);
-            $failed++;
-            continue;
+            echo "  " . ansi('31m') . "✗ No captcha challenge" . ansi('0m') . "\n";
+            sleep(30); $fails++; continue;
         }
     } else {
-        $remain_h = round(($captcha_ok_until - time()) / 3600, 1);
-        L("[2/3] Captcha still valid ({$remain_h}h), skip");
+        $rh = $cap_ok_until > 0 ? round(($cap_ok_until - time()) / 3600, 1) : 0;
+        if ($cap_req && $rh > 0) {
+            echo "  " . dim("🔓 Captcha valid ({$rh}h)") . "\n";
+        }
     }
 
-    // ---- STEP 3: CLAIM ----
-    // Cek cooldown dari init
-    if ($cooldown > 0) {
-        L("[3/3] Cooldown: {$cooldown}s, skip claim");
-        zzz($cooldown + 2);
+    // ─── COOLDOWN CHECK ───
+    if ($cd > 0) {
+        echo "  " . ansi('35m') . "⏳ Cooldown {$cd}s..." . ansi('0m') . "\n";
+        live_cd($cd, $bal, $claims, $fails, $rate, $mem);
         $retries = 0;
         continue;
     }
 
-    L("[3/3] Claim...");
-
+    // ─── CLAIM ───
+    echo "  " . ansi('33m') . "💰 Claiming..." . ansi('0m');
     $claim = post('/api/claim');
 
     if ($claim === null) {
-        L("  \033[31mClaim network error\033[0m");
-        $retries++;
-        zzz(15);
-        $failed++;
-        continue;
+        echo ansi('1A') . ansi('2K') . "\r";
+        echo "  " . ansi('31m') . "✗ Network error" . ansi('0m') . "\n";
+        $retries++; $fails++; sleep(15); continue;
     }
 
-    if (isset($claim['_error'])) {
-        $msg = $claim['_error'];
-        L("  \033[31mClaim: {$msg}\033[0m");
-
+    if (isset($claim['_err'])) {
+        $msg = $claim['_err'];
+        echo ansi('1A') . ansi('2K') . "\r";
         if (stripos($msg, 'captcha') !== false) {
-            // Captcha expired, force re-solve
-            $captcha_ok_until = 0;
-            zzz(5);
-            continue;
+            $cap_ok_until = 0;
+            echo "  " . ansi('33m') . "🔄 Captcha expired, re-solving..." . ansi('0m') . "\n";
+            sleep(3); continue;
         }
-
-        if (preg_match('/(\d+)\s*s/', $msg, $m)) {
+        if (preg_match('/(\d+)\s*s/i', $msg, $m)) {
             $w = (int)$m[1] + 2;
-            L("  Wait {$w}s");
-            zzz($w);
-            $retries = 0;
-            continue;
+            echo "  " . ansi('35m') . "⏳ Cooldown: {$w}s" . ansi('0m') . "\n";
+            live_cd($w, $bal, $claims, $fails, $rate, $mem);
+            $retries = 0; continue;
         }
-
-        $retries++;
-        zzz(10);
-        $failed++;
-        continue;
+        echo "  " . ansi('31m') . "✗ Claim: {$msg}" . ansi('0m') . "\n";
+        $retries++; $fails++; sleep(10); continue;
     }
 
-    // Claim success → dapat session_uid
-    $session_uid = $claim['session_uid'] ?? '';
-    $reward_hint = (float)($claim['reward_sats'] ?? 0.5);
-
-    if (empty($session_uid)) {
-        L("  \033[31mNo session_uid in response\033[0m");
-        $retries++;
-        zzz(10);
-        $failed++;
-        continue;
+    $suid = $claim['session_uid'] ?? '';
+    if (empty($suid)) {
+        echo ansi('1A') . ansi('2K') . "\r";
+        echo "  " . ansi('31m') . "✗ No session_uid" . ansi('0m') . "\n";
+        $retries++; $fails++; sleep(10); continue;
     }
 
-    L("  session_uid: " . substr($session_uid, 0, 16) . "...");
+    // ─── CONFIRM ───
+    $conf = post('/api/claim/confirm', ['session_uid' => $suid, 'token' => '']);
 
-    // ---- STEP 4: CONFIRM (bypass ad) ----
-    L("[4/4] Confirm...");
-
-    $confirm = post('/api/claim/confirm', [
-        'session_uid' => $session_uid,
-        'token'       => '',
-    ]);
-
-    if ($confirm === null) {
-        L("  \033[31mConfirm network error\033[0m");
-        $failed++;
-        zzz(10);
-        continue;
+    if ($conf === null || isset($conf['_err'])) {
+        $msg = $conf['_err'] ?? 'network';
+        echo ansi('1A') . ansi('2K') . "\r";
+        echo "  " . ansi('31m') . "✗ Confirm: {$msg}" . ansi('0m') . "\n";
+        $fails++; sleep(10); continue;
     }
 
-    if (isset($confirm['_error'])) {
-        $msg = $confirm['_error'];
-        L("  \033[31mConfirm: {$msg}\033[0m");
-        $failed++;
-        zzz(10);
-        continue;
-    }
-
-    // SUCCESS!
-    $new_bal = (float)($confirm['new_balance'] ?? $balance);
-    $reward  = (float)($confirm['reward'] ?? $reward_hint);
-    $cd      = (int)($confirm['cooldown'] ?? $CD_SEC);
+    // ─── SUCCESS ───
+    $new_bal = (float)($conf['new_balance'] ?? $bal);
+    $reward  = (float)($conf['reward'] ?? 0.5);
+    $cd      = (int)($conf['cooldown'] ?? $C['cd']);
     $claims++;
     $retries = 0;
-    $failed  = 0;
+    $fails   = 0;
 
-    $elapsed = time() - $t0;
-    $mem     = round(memory_get_usage(true) / 1048576, 1);
-    $rate    = $elapsed > 0 ? round(($claims / $elapsed) * 3600, 1) : 0;
+    $up   = time() - $t0;
+    $rate = $up > 0 ? round(($claims / $up) * 3600, 1) : 0;
+    $mem  = round(memory_get_usage(true) / 1048576, 1);
 
-    L("  \033[32m+{$reward} sats\033[0m | Bal: \033[33m{$new_bal}\033[0m sats | CD: {$cd}s");
-    L("  Stats: {$claims} claims, {$failed} fails, {$elapsed}s uptime, {$rate}/hr, {$mem}MB");
+    echo ansi('1A') . ansi('2K') . "\r";
+    echo "  " . ansi('32m') . "🪙 +" . ansi('1m') . "{$reward}" . ansi('22m') . " sats" . ansi('0m');
+    echo "  Bal:" . ansi('33m') . " {$new_bal}" . ansi('0m');
+    echo "  CD:" . ansi('35m') . "{$cd}s" . ansi('0m');
+    echo "  #" . ansi('1m') . "{$claims}" . ansi('0m');
+    echo "  " . dim("{$rate}/hr {$mem}MB") . "\n";
 
-    // Cooldown
-    L("  --- cooldown {$cd}s ---");
-    zzz($cd + 2);
+    // Live cooldown
+    live_cd($cd, $new_bal, $claims, $fails, $rate, $mem);
 
-    // GC tiap 10 claims
-    if ($claims % 10 === 0) {
-        gc_collect_cycles();
-    }
+    if ($claims % 10 === 0) @gc_collect_cycles();
 }
 
-$elapsed = time() - $t0;
-L("=== Bot stopped. {$claims} claims, {$failed} fails, {$elapsed}s ===\n");
+cursor_show();
+$up = time() - $t0;
+echo "\n  " . ansi('33m') . "═══ Stopped: {$claims} claims, {$fails} fails, " . round($up/60) . "min ═══" . ansi('0m') . "\n\n";
